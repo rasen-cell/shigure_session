@@ -25,7 +25,8 @@
   --bg: #0d1013;       /* 深夜。窓の外 */
   --panel-bg: #f2f4f2; /* 蛍光灯の白 */
   --ink: #14181a;
-  --ink-dim: #4d5658;  /* 読み終えた行にも使うので、薄くしすぎない */
+  --ink-dim: #4d5658;  /* ボタンの控えめな文字 */
+  --ink-read: #333d40; /* 本文の「読み終えた行」。灰色に見せない程度に落とす */
   --line: #c9cfcb;
   --accent: #2f6f62;
   --accent-weak: #dfe8e4;
@@ -143,10 +144,20 @@ body.is-blank .app { display: none; }
 .say p {
   margin: 0 0 .5em;
   white-space: pre-wrap;
-  word-break: normal;
-  overflow-wrap: anywhere;
+  /* 日本語は文節で折り返す（対応ブラウザだけ。他は既定の折り返しのまま）。
+     縦画面は1行が20字しかないので、切れる位置が効く。
+     一字ずつ出しても崩れないのは、本文を最初から全部 DOM に入れてあるから
+     （src/ui.js の typeInto）。数字や英字は割らないので anywhere は使わない。 */
+  word-break: auto-phrase;
+  overflow-wrap: break-word;
 }
-.say p.old { color: var(--ink-dim); }
+/* 同じ台詞の2行目以降。行間を詰めて、ひとかたまりに見せる。
+   ここが空いていると、2行の台詞が別々の発言に見える。 */
+.say p.cont { margin-top: -.35em; }
+/* 読み終えた行。薄くしすぎない——狭い画面では、直前の行こそ読み返される。 */
+.say p.old { color: var(--ink-read); }
+/* まだ出ていない文字。場所だけ取っておく（打つあいだ行が動かないように）。 */
+.say .ghost { visibility: hidden; }
 .say p.narr { color: #4a5457; font-size: .94em; }
 .say p.sys  { color: var(--accent); font-size: .94em; }
 .say p.shout { letter-spacing: .04em; }
@@ -356,13 +367,17 @@ button.choice.poke.fading { opacity: .35; transition: opacity 1.2s linear; }
 /* --- モバイル：1カラム、大きめタップ領域 --- */
 @media (max-width: 560px) {
   :root {
-    --say-h: 15.5em;        /* 縦画面は本文をひろく取る */
+    /* 縦画面は本文をひろく取る。背の高い端末では画面の4割まで使う
+       （狭いと1ターンぶんが入りきらず、読んでいる途中の行が上から消える）。 */
+    --say-h: max(15.5em, 40dvh);
     --poke-h: 2.6em;
     /* 指摘の席 ＋ ボタン2段。細い画面では「やっぱりやめる」のような長い札が
        2行に折り返すので、その1行ぶんまで見込んでおく（足りないと下段が切れる）。 */
     --controls-h: 12.4em;
   }
   .app { padding: 0; }
+  /* 縦画面は1行が短い。左右を詰めて、1行に入る字数を増やす。 */
+  .say { padding: 12px 12px 6px; }
   .frame {
     width: 100%;
     height: 100dvh;
@@ -374,6 +389,17 @@ button.choice.poke.fading { opacity: .35; transition: opacity 1.2s linear; }
      折り返して、ボタン列が1行ぶん背が高くなる。 */
   button.choice { min-height: 2.8em; padding: .55em .5em; flex: 1 1 42%; }
   button.choice.card { flex: 1 1 27%; min-width: 0; }
+}
+
+/* --- 横向きの携帯：高さが足りない。絵をあきらめて、本文に回す --- */
+@media (max-height: 520px) and (orientation: landscape) {
+  :root {
+    --poke-h: 2.2em;
+    --controls-h: 9.4em;
+  }
+  .frame { grid-template-rows: 0 1fr auto; }   /* 立ち絵の段を畳む */
+  .say { height: auto; min-height: 0; }
+  button.choice { min-height: 2.4em; padding: .35em .7em; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1335,42 +1361,80 @@ function prefersReduced() {
 }
 
 /**
+ * いま読んでいる断片の、最初の行。
+ * 「読み終えた色」に落とすのも、あふれた行を捨てるのも、この単位で行う。
+ * 行ごとにやると、2行の台詞の1行目が、読んでいる最中に薄くなる。
+ */
+let blockHead = null;
+
+/**
  * 入りきらなくなったら、古い行を上から捨てる。
  * スクロールさせない＝上端に「半分だけ見えている行」を作らない（読みにくいので）。
  */
 function trimOverflow() {
-  while (el.say.scrollHeight > el.say.clientHeight && el.sayLines.children.length > 1) {
+  const over = () => el.say.scrollHeight > el.say.clientHeight;
+  // まず、読み終えた断片から捨てる。いま読んでいる断片には手を付けない。
+  while (over() && el.sayLines.children.length > 1 && el.sayLines.firstChild !== blockHead) {
     el.sayLines.removeChild(el.sayLines.firstChild);
+  }
+  // それでも入らない＝断片ひとつで枠より高い。そのときだけ、中も上から捨てる
+  // （捨てないと、打っている先頭が枠の外に出て見えなくなる）。
+  while (over() && el.sayLines.children.length > 1) {
+    el.sayLines.removeChild(el.sayLines.firstChild);
+    blockHead = el.sayLines.firstChild;
   }
   el.say.scrollTop = el.say.scrollHeight;
 }
 
-function pushLine(cls) {
+/** ここまでの行を「読み終えた」にする。断片の切れ目でだけ呼ぶ。 */
+function markRead() {
+  for (const n of el.sayLines.querySelectorAll('p')) n.classList.add('old');
+}
+
+function pushLine(cls, cont) {
   const p = document.createElement('p');
-  if (cls) p.className = cls;
+  p.className = `${cls ?? ''}${cont ? ' cont' : ''}`.trim();
   el.sayLines.appendChild(p);
-  [...el.sayLines.querySelectorAll('p')].slice(0, -1).forEach((n) => n.classList.add('old'));
+  if (!cont) blockHead = p;
   trimOverflow();
   return p;
 }
 
+/**
+ * 一字ずつ出す。ただし**文字列は最初から全部 DOM に入れておき**、まだ出ていない
+ * ぶんを見えなくしておく。
+ *
+ * 文字を足しながら折り返させると、行が増えるたびに上の行が1行ぶん跳ね上がる。
+ * 1行が短い縦画面では断片のほとんどが折り返すので、読んでいる最中にほぼ毎回
+ * 画面が動くことになり、これが「読みづらい」の正体だった（実測：縦画面で
+ * デスクトップの倍のずれ）。先に場所を決めてしまえば、一度も動かない。
+ */
 function typeInto(node, text) {
   const ms = prefersReduced() ? 0 : speedMs();
-  if (ms === 0) { node.textContent = text; return Promise.resolve(); }
+  const shown = document.createElement('span');
+  const rest = document.createElement('span');
+  rest.className = 'ghost';
+  node.textContent = '';
+  node.append(shown, rest);
+  const put = (i) => { shown.textContent = text.slice(0, i); rest.textContent = text.slice(i); };
+
+  put(text.length);
+  trimOverflow();               // 捨てる行があるなら、読みはじめる前に捨てておく
+  if (ms === 0) return Promise.resolve();
+  put(0);
+
   return new Promise((resolve) => {
     let i = 0;
     let timer = null;
     const finish = () => {
       clearTimeout(timer);
-      node.textContent = text;
-      trimOverflow();
+      put(text.length);
       typingSkip = null;
       resolve();
     };
     typingSkip = finish;
     const step = () => {
-      node.textContent = text.slice(0, ++i);
-      trimOverflow();
+      put(++i);
       if (i >= text.length) { finish(); return; }
       timer = setTimeout(step, text[i - 1] === '\n' ? ms * 4 : ms);
     };
@@ -1393,8 +1457,9 @@ function waitAdvance() {
 async function say(text, opts = {}) {
   if (text == null || text === '') return;
   const lines = String(text).split('\n');
+  markRead();                       // 前の断片までを、読み終えた色にする
   for (let i = 0; i < lines.length; i++) {
-    const node = pushLine(opts.cls);
+    const node = pushLine(opts.cls, i > 0);
     if (opts.sound && i === 0) se(opts.sound);
     await typeInto(node, lines[i]);
     trimOverflow();
@@ -1410,7 +1475,7 @@ async function say(text, opts = {}) {
   await waitAdvance();
 }
 
-function clearText() { el.sayLines.innerHTML = ''; }
+function clearText() { el.sayLines.innerHTML = ''; blockHead = null; }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
